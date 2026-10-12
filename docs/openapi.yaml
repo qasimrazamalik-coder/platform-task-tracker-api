@@ -1,0 +1,188 @@
+openapi: 3.0.3
+info:
+  title: Platform Tracker API
+  version: 1.0.0
+  description: |
+    Project and task tracker with per-project roles (owner > maintainer > member > viewer),
+    a status workflow, WIP limits, dependencies, optimistic locking and flow metrics.
+
+    Tasks are addressed as `/projects/{key}/tasks/{number}`, e.g. PLAT-12 is `/projects/PLAT/tasks/12`.
+
+    **Optimistic locking:** every task carries a `version`. Edits and transitions must send the
+    version the client last saw; if someone changed the task since, the API answers
+    `409 VERSION_CONFLICT` with the current task in `error.details.current`.
+
+    **Workflow:** backlog → todo → in_progress → in_review → done, plus in_progress ⇄ blocked,
+    in_review → in_progress (changes requested) and done → todo (reopen). Rules: viewers are read-only;
+    members move only their own or unassigned tasks; starting unassigned work assigns it to you;
+    starting needs every dependency done and the assignee under the WIP limit; approving (→ done)
+    needs a maintainer who is not the assignee; reopening needs a maintainer.
+
+    Seed accounts (password `password123`): sana@platform.test (owner), omar@platform.test (maintainer),
+    hamza@platform.test and ayesha@platform.test (members), rehan@platform.test (viewer).
+servers:
+  - url: /api
+security:
+  - bearer: []
+components:
+  securitySchemes:
+    bearer: { type: http, scheme: bearer, bearerFormat: JWT }
+  parameters:
+    key: { name: key, in: path, required: true, schema: { type: string, example: PLAT } }
+    number: { name: number, in: path, required: true, schema: { type: integer, example: 3 } }
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: { type: string, example: WIP_LIMIT }
+            message: { type: string }
+            details: {}
+    Task:
+      type: object
+      properties:
+        ref: { type: string, example: PLAT-3 }
+        number: { type: integer }
+        title: { type: string }
+        description: { type: string }
+        status: { type: string, enum: [backlog, todo, in_progress, blocked, in_review, done] }
+        priority: { type: string, enum: [low, normal, high, urgent] }
+        assignee: { type: object, nullable: true, properties: { handle: { type: string }, name: { type: string } } }
+        reporter: { type: object, properties: { handle: { type: string }, name: { type: string } } }
+        dueDate: { type: string, format: date, nullable: true }
+        overdue: { type: boolean }
+        position: { type: number }
+        version: { type: integer }
+        openDependencies: { type: integer }
+        commentCount: { type: integer }
+    TaskDetail:
+      allOf:
+        - $ref: '#/components/schemas/Task'
+        - type: object
+          properties:
+            dependsOn: { type: array, items: { type: object } }
+            blocks: { type: array, items: { type: object } }
+            comments: { type: array, items: { type: object } }
+            activity: { type: array, items: { type: object } }
+            allowedTransitions: { type: array, items: { type: string }, description: Moves the caller could make right now }
+  responses:
+    Error: { description: Error, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+paths:
+  /auth/register:
+    post:
+      tags: [Auth]
+      security: []
+      requestBody: { content: { application/json: { schema: { type: object, required: [name, handle, email, password], properties: { name: { type: string }, handle: { type: string }, email: { type: string }, password: { type: string } } } } } }
+      responses: { '201': { description: Created }, '409': { $ref: '#/components/responses/Error' } }
+  /auth/login:
+    post:
+      tags: [Auth]
+      security: []
+      requestBody: { content: { application/json: { schema: { type: object, properties: { email: { type: string }, password: { type: string } } } } } }
+      responses: { '200': { description: 'Returns { token, user }' }, '401': { $ref: '#/components/responses/Error' } }
+  /auth/me:
+    get: { tags: [Auth], summary: Current user with unread notification count, responses: { '200': { description: OK } } }
+  /projects:
+    get: { tags: [Projects], summary: Projects I belong to, responses: { '200': { description: OK } } }
+    post:
+      tags: [Projects]
+      summary: Create a project. The creator becomes owner.
+      requestBody: { content: { application/json: { schema: { type: object, required: [key, name], properties: { key: { type: string, example: PLAT }, name: { type: string }, description: { type: string }, wipLimit: { type: integer, default: 3 } } } } } }
+      responses: { '201': { description: Created }, '409': { $ref: '#/components/responses/Error' } }
+  /projects/{key}:
+    parameters: [{ $ref: '#/components/parameters/key' }]
+    get: { tags: [Projects], summary: Project with members and their current WIP. Non-members get 404., responses: { '200': { description: OK }, '404': { $ref: '#/components/responses/Error' } } }
+    patch: { tags: [Projects], summary: Rename or change the WIP limit (maintainer), responses: { '200': { description: OK } } }
+  /projects/{key}/members:
+    parameters: [{ $ref: '#/components/parameters/key' }]
+    post:
+      tags: [Projects]
+      summary: Add someone by handle. Maintainers add members/viewers; owners add anyone.
+      requestBody: { content: { application/json: { schema: { type: object, properties: { handle: { type: string }, role: { type: string, enum: [owner, maintainer, member, viewer] } } } } } }
+      responses: { '201': { description: Added }, '403': { $ref: '#/components/responses/Error' } }
+  /projects/{key}/members/{handle}:
+    parameters: [{ $ref: '#/components/parameters/key' }, { name: handle, in: path, required: true, schema: { type: string } }]
+    patch: { tags: [Projects], summary: Change role (owner). The last owner cannot be demoted., responses: { '200': { description: OK }, '409': { $ref: '#/components/responses/Error' } } }
+    delete: { tags: [Projects], summary: Remove (owner) or leave. Their open tasks return to the pool., responses: { '204': { description: Removed } } }
+  /projects/{key}/activity:
+    parameters: [{ $ref: '#/components/parameters/key' }]
+    get:
+      tags: [Projects]
+      summary: Activity feed, newest first, keyset-paginated
+      parameters: [{ name: before, in: query, schema: { type: integer } }, { name: limit, in: query, schema: { type: integer, default: 30 } }]
+      responses: { '200': { description: 'Returns { items, nextBefore }' } }
+  /projects/{key}/metrics:
+    parameters: [{ $ref: '#/components/parameters/key' }]
+    get:
+      tags: [Projects]
+      summary: Status counts, weekly throughput, cycle time (median and mean), WIP per person, overdue count
+      parameters: [{ name: weeks, in: query, schema: { type: integer, default: 8 } }]
+      responses: { '200': { description: OK } }
+  /projects/{key}/tasks:
+    parameters: [{ $ref: '#/components/parameters/key' }]
+    get:
+      tags: [Tasks]
+      parameters:
+        - { name: status, in: query, schema: { type: string } }
+        - { name: assignee, in: query, description: 'a handle, or "me"', schema: { type: string } }
+        - { name: q, in: query, description: Title text or a ref like PLAT-3, schema: { type: string } }
+        - { name: overdue, in: query, schema: { type: string, enum: ['true', 'false'] } }
+      responses: { '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Task' } } } } } }
+    post:
+      tags: [Tasks]
+      summary: Create (member). Numbers are per project and never repeat.
+      requestBody: { content: { application/json: { schema: { type: object, required: [title], properties: { title: { type: string }, description: { type: string }, status: { type: string, enum: [backlog, todo] }, priority: { type: string }, assignee: { type: string }, dueDate: { type: string, format: date } } } } } }
+      responses: { '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/Task' } } } } }
+  /projects/{key}/tasks/{number}:
+    parameters: [{ $ref: '#/components/parameters/key' }, { $ref: '#/components/parameters/number' }]
+    get: { tags: [Tasks], responses: { '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/TaskDetail' } } } } } }
+    patch:
+      tags: [Tasks]
+      summary: Edit fields or reassign. Requires the current version.
+      requestBody: { content: { application/json: { schema: { type: object, required: [version], properties: { version: { type: integer }, title: { type: string }, description: { type: string }, priority: { type: string }, assignee: { type: string, nullable: true }, dueDate: { type: string, nullable: true } } } } } }
+      responses: { '200': { description: OK }, '409': { $ref: '#/components/responses/Error' } }
+  /projects/{key}/tasks/{number}/transition:
+    parameters: [{ $ref: '#/components/parameters/key' }, { $ref: '#/components/parameters/number' }]
+    post:
+      tags: [Tasks]
+      summary: Move through the workflow
+      description: Errors include INVALID_TRANSITION, NOT_YOUR_TASK, FOUR_EYES, NEEDS_MAINTAINER, WIP_LIMIT, BLOCKED_BY_DEPENDENCIES, VERSION_CONFLICT.
+      requestBody: { content: { application/json: { schema: { type: object, required: [to, version], properties: { to: { type: string }, version: { type: integer } } } } } }
+      responses: { '200': { description: OK }, '403': { $ref: '#/components/responses/Error' }, '409': { $ref: '#/components/responses/Error' } }
+  /projects/{key}/tasks/{number}/dependencies:
+    parameters: [{ $ref: '#/components/parameters/key' }, { $ref: '#/components/parameters/number' }]
+    post:
+      tags: [Tasks]
+      summary: Record that this task depends on another. Cycles are rejected.
+      requestBody: { content: { application/json: { schema: { type: object, properties: { dependsOn: { type: integer } } } } } }
+      responses: { '201': { description: 'Returns { dependsOn, blocks }' }, '409': { $ref: '#/components/responses/Error' } }
+  /projects/{key}/tasks/{number}/dependencies/{dependsOn}:
+    parameters: [{ $ref: '#/components/parameters/key' }, { $ref: '#/components/parameters/number' }, { name: dependsOn, in: path, required: true, schema: { type: integer } }]
+    delete: { tags: [Tasks], responses: { '204': { description: Removed } } }
+  /projects/{key}/tasks/{number}/position:
+    parameters: [{ $ref: '#/components/parameters/key' }, { $ref: '#/components/parameters/number' }]
+    put:
+      tags: [Tasks]
+      summary: Reorder. Places the task just before another one, or at the end when before is null.
+      requestBody: { content: { application/json: { schema: { type: object, properties: { before: { type: integer, nullable: true } } } } } }
+      responses: { '200': { description: OK } }
+  /projects/{key}/tasks/{number}/comments:
+    parameters: [{ $ref: '#/components/parameters/key' }, { $ref: '#/components/parameters/number' }]
+    post:
+      tags: [Tasks]
+      summary: Comment. @handles of project members are notified.
+      requestBody: { content: { application/json: { schema: { type: object, properties: { body: { type: string } } } } } }
+      responses: { '201': { description: Created } }
+  /notifications:
+    get:
+      tags: [Notifications]
+      parameters: [{ name: unread, in: query, schema: { type: string, enum: ['true', 'false'] } }]
+      responses: { '200': { description: OK } }
+  /notifications/read:
+    post:
+      tags: [Notifications]
+      summary: Mark given ids, or all when ids is omitted, as read
+      requestBody: { content: { application/json: { schema: { type: object, properties: { ids: { type: array, items: { type: integer } } } } } } }
+      responses: { '200': { description: OK } }
